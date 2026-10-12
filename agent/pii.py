@@ -28,12 +28,43 @@ set ở tests/vn_pii_testset.jsonl):
 
 Đo bằng: pytest tests/test_pii.py -v -s   (in ra precision/recall)
 """
-from __future__ import annotations
+import re
 
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    """Phát hiện các thực thể PII tiếng Việt: VN_CCCD, VN_PHONE, VN_BANK_ACCOUNT, EMAIL."""
+    entities: list[dict] = []
+
+    # 1. EMAIL
+    for m in re.finditer(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text):
+        entities.append({"type": "EMAIL", "start": m.start(), "end": m.end()})
+
+    # 2. VN_BANK_ACCOUNT (thường đi sau STK hoặc số tài khoản)
+    for m in re.finditer(r"(?<=\bSTK\s)\d{8,16}\b", text):
+        entities.append({"type": "VN_BANK_ACCOUNT", "start": m.start(), "end": m.end()})
+
+    bank_spans = {(e["start"], e["end"]) for e in entities}
+
+    # 3. VN_CCCD (12 chữ số liên tiếp, không trùng với STK đã nhận diện)
+    for m in re.finditer(r"\b\d{12}\b", text):
+        if (m.start(), m.end()) not in bank_spans:
+            entities.append({"type": "VN_CCCD", "start": m.start(), "end": m.end()})
+
+    # 4. VN_PHONE (10 chữ số bắt đầu bằng 0, không trùng với STK)
+    for m in re.finditer(r"\b0\d{9}\b", text):
+        if (m.start(), m.end()) not in bank_spans:
+            entities.append({"type": "VN_PHONE", "start": m.start(), "end": m.end()})
+
+    entities.sort(key=lambda x: x["start"])
+    return entities
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    """Thay thế mọi thực thể PII bằng [REDACTED_<TYPE>] theo thứ tự từ cuối về đầu."""
+    entities = detect(text)
+    # Sắp xếp giảm dần theo start để thay thế từ cuối về đầu, không làm lệch offset
+    for entity in sorted(entities, key=lambda x: x["start"], reverse=True):
+        replacement = f"[REDACTED_{entity['type']}]"
+        text = text[: entity["start"]] + replacement + text[entity["end"] :]
+    return text
+

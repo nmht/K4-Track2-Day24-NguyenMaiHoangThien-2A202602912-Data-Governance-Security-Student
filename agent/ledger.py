@@ -35,14 +35,71 @@ Interface bắt buộc (tests/test_ledger.py và agent/runner.py gọi trực ti
 Sinh viên phải tự tay chứng minh được: sửa 1 ký tự trong 1 dòng giữa file
 rồi gọi verify() phải trả về False.
 """
-from __future__ import annotations
-
+import hashlib
+import json
 from pathlib import Path
 
 
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    """Ghi thêm một bản ghi vào ledger và nối chuỗi hash chain."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    prev_hash = "0" * 64
+    if path.exists():
+        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            last = json.loads(lines[-1])
+            prev_hash = last.get("hash", "0" * 64)
+
+    record = dict(entry)
+    record["prev_hash"] = prev_hash
+    data_to_hash = {k: v for k, v in record.items() if k != "hash"}
+    canonical = json.dumps(data_to_hash, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    record["hash"] = hashlib.sha256(canonical).hexdigest()
+
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    return record
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    """Xác thực tính toàn vẹn của chuỗi hash chain trong file ledger."""
+    path = Path(path)
+    if not path.exists():
+        return True
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    expected_prev = "0" * 64
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            return False
+
+        # Mọi dòng bắt buộc phải có reason không rỗng
+        if not obj.get("reason"):
+            return False
+
+        # prev_hash phải khớp với hash của dòng trước đó
+        if obj.get("prev_hash") != expected_prev:
+            return False
+
+        stored_hash = obj.get("hash")
+        if not stored_hash:
+            return False
+
+        # Tính lại hash để kiểm tra can thiệp nội dung
+        data_to_hash = {k: v for k, v in obj.items() if k != "hash"}
+        canonical = json.dumps(data_to_hash, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        calc_hash = hashlib.sha256(canonical).hexdigest()
+        if calc_hash != stored_hash:
+            return False
+
+        expected_prev = stored_hash
+
+    return True
+

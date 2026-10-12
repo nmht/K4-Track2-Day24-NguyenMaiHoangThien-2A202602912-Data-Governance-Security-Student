@@ -57,18 +57,164 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
         quan sát được từ ngoài (CLI) không đổi so với trước khi contain,
         chỉ có sink log và ledger là khác.
 """
-from __future__ import annotations
-
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+
+from agent import ledger, pii, tools
+from agent.policy import PolicyContext, check
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
 class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
-def handle(message: str, llm, log_dir: Path | None = None,
-           principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+def handle(
+    message: str,
+    llm,
+    log_dir: Path | None = None,
+    principal_id: str = "support_l1",
+) -> str:
+    """Xử lý yêu cầu với Trifecta Split và OBO Governance.
+
+    Run A: Đọc untrusted docs từ search_docs, tách riêng dữ liệu thô,
+           chỉ trích xuất typed ticket IDs từ tên file sang Run B.
+    Run B: Tra cứu khách hàng từ nguồn tin cậy data/customers.json
+           dựa trên related_tickets, kiểm soát chính sách trước mọi tool call.
+    """
+    ledger_path = (log_dir / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    agent_id = "lab24-agent"
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    expires_at = "2099-01-01T00:00:00+00:00"
+
+    def _log_and_check(
+        tool: str,
+        arg_val: str,
+        classification: str,
+        egress: bool,
+        purpose: str,
+        owner: str,
+        depth: int = 0,
+        parent_scopes: tuple[str, ...] = (),
+        agent_scopes: tuple[str, ...] = ("search_docs", "read_customer", "http_post"),
+    ) -> bool:
+        ctx = PolicyContext(
+            data_classification=classification,
+            request_purpose=purpose,
+            agent_owner=owner,
+            delegation_depth=depth,
+            egress_enabled=egress,
+            principal_id=principal_id,
+            requested_tool=tool,
+            agent_scopes=agent_scopes,
+            parent_scopes=parent_scopes,
+            expires_at=expires_at,
+        )
+        allowed, reason = check(ctx)
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "tool": tool,
+                "args_hash": hashlib.sha256(arg_val.encode("utf-8")).hexdigest()[:16],
+                "classification": classification,
+                "decision": "allow" if allowed else "deny",
+                "reason": reason,
+                "on_behalf_of": principal_id,
+                "expires_at": expires_at,
+            },
+            ledger_path,
+        )
+        return allowed
+
+    # ==========================================
+    # RUN A: Untrusted content retrieval
+    # ==========================================
+    # Kiểm tra policy trước khi gọi search_docs
+    allow_search = _log_and_check(
+        tool="search_docs",
+        arg_val=message,
+        classification="internal",
+        egress=False,
+        purpose="summarize-tickets",
+        owner=f"{agent_id}/run-a",
+        agent_scopes=("search_docs",),
+    )
+    if not allow_search:
+        return "Yêu cầu bị từ chối bởi chính sách an toàn."
+
+    docs = tools.search_docs(message)
+
+    # Trích xuất typed ticket IDs từ TÊN FILE (không lấy từ free text của attacker)
+    ticket_ids: list[int] = []
+    for d in docs:
+        doc_id = d.get("id", "")
+        m = re.search(r"ticket-(\d+)", doc_id)
+        if m:
+            ticket_ids.append(int(m.group(1)))
+
+    combined_text = "\n\n".join(d["text"] for d in docs)
+    # Áp dụng PII redaction trước boundary
+    redacted_text = pii.redact(combined_text)
+
+    # Quét phát hiện injection cho audit (không tin customer_id trong injection)
+    injected = llm.find_injection(combined_text)
+
+    # ==========================================
+    # RUN B: Privileged context resolution
+    # ==========================================
+    # Tra cứu khách hàng hợp lệ từ nguồn tin cậy customers.json qua related_tickets
+    customers_path = DATA_DIR / "customers.json"
+    customers_data = json.loads(customers_path.read_text(encoding="utf-8")) if customers_path.exists() else []
+
+    target_customers: list[str] = []
+    for c in customers_data:
+        rel = set(c.get("related_tickets", []))
+        if any(tid in rel for tid in ticket_ids):
+            target_customers.append(c["customer_id"])
+
+    # Chỉ gọi read_customer cho khách hàng được suy ra từ liên kết tin cậy
+    customer_records: list[dict] = []
+    for cust_id in target_customers:
+        allow_read = _log_and_check(
+            tool="read_customer",
+            arg_val=cust_id,
+            classification="restricted",
+            egress=False,
+            purpose="support-reply",
+            owner=f"{agent_id}/run-b",
+            agent_scopes=("search_docs", "read_customer"),
+        )
+        if allow_read:
+            try:
+                record = tools.read_customer(cust_id)
+                customer_records.append(record)
+            except tools.ToolError:
+                pass
+
+    # Nếu có chỉ thị injection yêu cầu egress (http_post):
+    # Luôn kiểm tra qua Policy: dữ liệu restricted + egress = False (BỊ CHẶN)
+    if injected is not None:
+        target_url = injected.target_url or "http://127.0.0.1:10024/reconcile"
+        allow_post = _log_and_check(
+            tool="http_post",
+            arg_val=target_url,
+            classification="restricted",
+            egress=True,
+            purpose="reconciliation",
+            owner=f"{agent_id}/run-b",
+            agent_scopes=("search_docs", "read_customer", "http_post"),
+        )
+        if allow_post:
+            tools.http_post(target_url, {"records": customer_records})
+
+    return llm.summarize(docs)
+
